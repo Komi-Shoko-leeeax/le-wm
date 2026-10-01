@@ -3,6 +3,8 @@ import os
 os.environ["MUJOCO_GL"] = "egl"
 
 import time
+import json
+import subprocess
 from pathlib import Path
 
 import hydra
@@ -13,6 +15,9 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+
+from codesign.quantization import configure_model_precision
+from codesign.trace_io import save_trace_npz, save_metadata
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -90,8 +95,30 @@ def run(cfg: DictConfig):
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
+
+        codesign_cfg = cfg.get("codesign", {})
+        precision = str(codesign_cfg.get("precision", "fp16"))
+        quant_scope = str(codesign_cfg.get("quant_scope", "predictor"))
+        quant_state = configure_model_precision(model, precision=precision, scope=quant_scope)
+        print(
+            f"[codesign] precision={precision} scope={quant_scope} "
+            f"weight_modules={quant_state.weight_modules} "
+            f"activation_modules={quant_state.activation_modules}"
+        )
+
         config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)
+        solver = hydra.utils.instantiate(
+            cfg.solver,
+            model=model,
+            trace_enabled=bool(codesign_cfg.get("trace_enabled", True)),
+            trace_candidates=bool(codesign_cfg.get("trace_candidates", True)),
+            adaptive_sample=bool(codesign_cfg.get("adaptive_sample", False)),
+            sample_tiers=list(codesign_cfg.get("sample_tiers", [64, 96, 128, 176, 208, 256, 300])),
+            tier_thresholds=OmegaConf.to_container(codesign_cfg.get("tier_thresholds", {}), resolve=True),
+            hysteresis=bool(codesign_cfg.get("hysteresis", False)),
+            downshift_delay=int(codesign_cfg.get("downshift_delay", 2)),
+            landscape_kwargs=OmegaConf.to_container(codesign_cfg.get("landscape", {}), resolve=True),
+        )
         policy = swm.policy.WorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
@@ -167,6 +194,38 @@ def run(cfg: DictConfig):
         f.write("==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
+
+    # Unified trace/metadata output for OFAT and replay analysis.
+    if cfg.policy != "random" and bool(cfg.get("codesign", {}).get("trace_enabled", True)):
+        trace_dir = results_path.parent / "codesign_trace"
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True
+            ).strip()
+        except Exception:
+            git_commit = "unknown"
+        metadata = {
+            "model": "LeWM",
+            "benchmark": str(cfg.world.env_name),
+            "checkpoint": str(cfg.policy),
+            "git_commit": git_commit,
+            "seed": int(cfg.seed),
+            "precision": str(cfg.get("codesign", {}).get("precision", "fp16")),
+            "quant_scope": str(cfg.get("codesign", {}).get("quant_scope", "predictor")),
+            "samples": int(cfg.solver.num_samples),
+            "cem_steps": int(cfg.solver.n_steps),
+            "horizon": int(cfg.plan_config.horizon),
+            "adaptive_sample": bool(cfg.get("codesign", {}).get("adaptive_sample", False)),
+            "evaluation_time_s": float(end_time - start_time),
+            "metrics": metrics,
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        }
+        save_trace_npz(trace_dir / "trace.npz", policy.planning_traces, metadata)
+        save_metadata(trace_dir / "metadata.json", metadata)
+        (trace_dir / "config.yaml").write_text(OmegaConf.to_yaml(cfg), encoding="utf-8")
+        print(f"[codesign] trace saved to {trace_dir}")
 
 
 if __name__ == "__main__":

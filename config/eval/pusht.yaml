@@ -44,3 +44,27 @@ eval:
           
 output:
   filename: pusht_results.txt
+
+# FPGA co-design / planning-characterization controls.
+codesign:
+  precision: fp16          # fp16 | w8a16 | w8a8
+  quant_scope: predictor   # predictor | encoder | all
+  trace_enabled: true
+  trace_candidates: true
+  adaptive_sample: false   # enable after K/U thresholds are calibrated
+  sample_tiers: [64, 96, 128, 176, 208, 256, 300]
+  tier_thresholds: {}      # e.g. {1: [0.2,0.4,...], 2: [...]}
+  hysteresis: false
+  downshift_delay: 2
+  landscape:
+    mode_radius: 2.0
+    energy_weight: 0.45
+    spread_weight: 0.35
+    temporal_weight: 0.20
+    spread_scale: 1.0
+    mean_shift_scale: 1.0
+  replay_trace: null
+  replay_mode: static_sample  # static_sample | suffix | rescore | prefix_validate
+  replay_planning_call: 0
+  replay_output: codesign_replay.npz
+

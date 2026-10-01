@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+from codesign.quantization import autocast_context
+
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
 
@@ -126,28 +128,27 @@ class JEPA(nn.Module):
         return cost
 
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
-        """ Compute the cost of action candidates given an info dict with goal and initial state."""
+        """Compute candidate costs under the configured experiment precision."""
+        with autocast_context(self):
+            assert "goal" in info_dict, "goal not in info_dict"
 
-        assert "goal" in info_dict, "goal not in info_dict"
+            # Do not mutate the caller's dictionary across CEM iterations.
+            info_dict = dict(info_dict)
+            device = next(self.parameters()).device
+            for k in list(info_dict.keys()):
+                if torch.is_tensor(info_dict[k]):
+                    info_dict[k] = info_dict[k].to(device)
 
-        device = next(self.parameters()).device
-        for k in list(info_dict.keys()):
-            if torch.is_tensor(info_dict[k]):
-                info_dict[k] = info_dict[k].to(device)
+            goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+            goal["pixels"] = goal["goal"]
 
-        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
-        goal["pixels"] = goal["goal"]
+            for k in list(info_dict.keys()):
+                if k.startswith("goal_"):
+                    goal[k[len("goal_") :]] = goal.pop(k)
 
-        for k in info_dict:
-            if k.startswith("goal_"):
-                goal[k[len("goal_") :]] = goal.pop(k)
+            goal.pop("action", None)
+            goal = self.encode(goal)
 
-        goal.pop("action")
-        goal = self.encode(goal)
-
-        info_dict["goal_emb"] = goal["emb"]
-        info_dict = self.rollout(info_dict, action_candidates)
-
-        cost = self.criterion(info_dict)
-        
-        return cost
+            info_dict["goal_emb"] = goal["emb"]
+            info_dict = self.rollout(info_dict, action_candidates)
+            return self.criterion(info_dict)
