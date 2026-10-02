@@ -47,6 +47,7 @@ output:
 
 # FPGA co-design / planning-characterization controls.
 codesign:
+  run_name: null
   precision: fp16          # fp16 | w8a16 | w8a8
   quant_scope: predictor   # predictor | encoder | all
   trace_enabled: true

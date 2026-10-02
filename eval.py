@@ -214,7 +214,11 @@ def run(cfg: DictConfig):
 
     # Unified trace/metadata output for OFAT and replay analysis.
     if cfg.policy != "random" and bool(cfg.get("codesign", {}).get("trace_enabled", True)):
-        trace_dir = results_path.parent / "codesign_trace"
+        run_name = cfg.get("codesign", {}).get("run_name", None)
+        if run_name:
+            trace_dir = results_path.parent / "codesign_runs" / str(run_name)
+        else:
+            trace_dir = results_path.parent / "codesign_trace"
         try:
             git_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True
