@@ -16,10 +16,10 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
-from codesign.quantization import configure_model_precision, autocast_context
+from codesign.quantization import configure_model_precision
 from codesign.trace_io import save_trace_npz, save_metadata
 from codesign.cost_adapter import PrecisionAwareShootingCostEvaluator
-from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
+from stable_worldmodel.planning import GoalMSE
 
 def img_transform(cfg):
     transform = transforms.Compose(
