@@ -31,11 +31,31 @@ from stable_worldmodel.planning import GoalMSE
 from codesign.trace_io import load_trace_npz, save_trace_npz, to_torch_tree
 
 
-def _solver_from_record(cfg: DictConfig, model, record: dict):
+def _solver_from_record(
+    cfg: DictConfig,
+    model,
+    record: dict,
+    batch_idx: int = 0,
+):
     trace_batches = record["trace"]
-    if not trace_batches or not trace_batches[0]:
+
+    batch_idx = int(batch_idx)
+
+    if not trace_batches:
         raise ValueError("planning record does not contain a CEM trace")
-    first = trace_batches[0][0]
+
+    if batch_idx < 0 or batch_idx >= len(trace_batches):
+        raise IndexError(
+            f"replay_batch_index={batch_idx}, "
+            f"but record only has {len(trace_batches)} solver batches"
+        )
+
+    if not trace_batches[batch_idx]:
+        raise ValueError(
+            f"solver batch {batch_idx} does not contain a CEM trace"
+        )
+
+    first = trace_batches[batch_idx][0]
     mean = np.asarray(first["prev_mean"])
     batch, horizon, blocked_dim = mean.shape
     action_block = int(cfg.plan_config.action_block)
@@ -63,6 +83,43 @@ def _solver_from_record(cfg: DictConfig, model, record: dict):
     )
     solver.configure(action_space=action_space, n_envs=batch, config=plan_cfg)
     return solver
+
+
+
+def _slice_batch_tree(x, start: int, end: int, total: int):
+    """Slice only objects whose leading dimension is the full env batch."""
+    if torch.is_tensor(x):
+        if x.ndim > 0 and x.shape[0] == total:
+            return x[start:end]
+        return x
+
+    if isinstance(x, np.ndarray):
+        if x.ndim > 0 and x.shape[0] == total:
+            return x[start:end]
+        return x
+
+    if isinstance(x, dict):
+        return {
+            k: _slice_batch_tree(v, start, end, total)
+            for k, v in x.items()
+        }
+
+    if isinstance(x, list):
+        if len(x) == total:
+            return x[start:end]
+        return [
+            _slice_batch_tree(v, start, end, total)
+            for v in x
+        ]
+
+    if isinstance(x, tuple):
+        return tuple(
+            _slice_batch_tree(v, start, end, total)
+            for v in x
+        )
+
+    return x
+
 
 
 @hydra.main(version_base=None, config_path="../config/eval", config_name="pusht")
@@ -103,12 +160,92 @@ def run(cfg: DictConfig):
             "PrecisionAwareShootingCostEvaluator + GoalMSE"
         )
 
-    solver = _solver_from_record(cfg, cost_model, record)
-    info = to_torch_tree(record["replay_info_dict"], device="cpu")
-    trace = to_torch_tree(record["trace"][0], device="cpu")
+    # A planning record may contain multiple environments, while CEM can
+    # internally solve them in smaller solver batches (Push-T uses batch_size=1).
+    # Replay one saved solver batch at a time so that:
+    #
+    #     replay_info_dict batch
+    #     selected_action batch
+    #     saved proposal batch
+    #
+    # are exactly aligned.
+    trace_batches = record["trace"]
+    replay_batch_idx = int(c.get("replay_batch_index", 0))
+
+    if replay_batch_idx < 0 or replay_batch_idx >= len(trace_batches):
+        raise IndexError(
+            f"replay_batch_index={replay_batch_idx}, "
+            f"available solver batches={len(trace_batches)}"
+        )
+
+    batch_sizes = [
+        int(np.asarray(tb[0]["prev_mean"]).shape[0])
+        for tb in trace_batches
+    ]
+
+    full_selected = to_torch_tree(
+        record["selected_action"],
+        device="cpu",
+    )
+
+    if not torch.is_tensor(full_selected):
+        raise TypeError("selected_action must be a tensor after loading")
+
+    total_envs = int(full_selected.shape[0])
+
+    if sum(batch_sizes) != total_envs:
+        raise ValueError(
+            "Replay batch geometry mismatch: "
+            f"trace batch sizes={batch_sizes}, "
+            f"selected_action batch={total_envs}"
+        )
+
+    start = sum(batch_sizes[:replay_batch_idx])
+    end = start + batch_sizes[replay_batch_idx]
+
+    full_info = to_torch_tree(
+        record["replay_info_dict"],
+        device="cpu",
+    )
+
+    info = _slice_batch_tree(
+        full_info,
+        start,
+        end,
+        total_envs,
+    )
+
+    trace = to_torch_tree(
+        trace_batches[replay_batch_idx],
+        device="cpu",
+    )
+
+    baseline_action = _slice_batch_tree(
+        full_selected,
+        start,
+        end,
+        total_envs,
+    )
+
+    solver = _solver_from_record(
+        cfg,
+        cost_model,
+        record,
+        batch_idx=replay_batch_idx,
+    )
+
+    baseline_action = baseline_action.to(solver.device)
+
+    print(
+        "[codesign replay] "
+        f"planning_call={call_idx} "
+        f"solver_batch={replay_batch_idx} "
+        f"env_slice=[{start}:{end}] "
+        f"batch_size={end-start}"
+    )
+
     # Reference energy of the baseline final mean under the currently loaded model.
     # For tier calibration this runner should be invoked with precision=fp16.
-    baseline_action = to_torch_tree(record["selected_action"], device=solver.device)
     baseline_ref_energy = solver.score_candidates(info, baseline_action.unsqueeze(1)).detach().cpu()
     tiers = [int(x) for x in c.get("sample_tiers", [64, 96, 128, 176, 208, 256, 300])]
     mode = str(c.get("replay_mode", "suffix"))
@@ -198,6 +335,8 @@ def run(cfg: DictConfig):
         "replay_precision": precision,
         "replay_quant_scope": quant_scope,
         "planning_call": call_idx,
+        "replay_batch_index": replay_batch_idx,
+        "replay_env_slice": [start, end],
         "tiers": tiers,
     }
     save_trace_npz(output, out_records, replay_meta)
