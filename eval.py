@@ -16,8 +16,10 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
-from codesign.quantization import configure_model_precision
+from codesign.quantization import configure_model_precision, autocast_context
 from codesign.trace_io import save_trace_npz, save_metadata
+from codesign.cost_adapter import PrecisionAwareShootingCostEvaluator
+from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -106,10 +108,25 @@ def run(cfg: DictConfig):
             f"activation_modules={quant_state.activation_modules}"
         )
 
+        # Current stable-worldmodel LeWM exposes encode()/rollout() as a
+        # Dynamics model. CEM requires a Costable object with get_cost().
+        # Compose the dynamics model with the original LeWM goal-MSE objective.
+        if hasattr(model, "get_cost"):
+            cost_model = model
+        else:
+            cost_model = PrecisionAwareShootingCostEvaluator(
+                model=model,
+                objective=GoalMSE(),
+            )
+            print(
+                "[codesign] wrapped Dynamics model with "
+                "ShootingCostEvaluator + GoalMSE"
+            )
+
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(
             cfg.solver,
-            model=model,
+            model=cost_model,
             trace_enabled=bool(codesign_cfg.get("trace_enabled", True)),
             trace_candidates=bool(codesign_cfg.get("trace_candidates", True)),
             adaptive_sample=bool(codesign_cfg.get("adaptive_sample", False)),
