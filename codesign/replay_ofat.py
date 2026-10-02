@@ -26,6 +26,8 @@ from omegaconf import DictConfig, OmegaConf
 import stable_worldmodel as swm
 
 from codesign.quantization import configure_model_precision
+from codesign.cost_adapter import PrecisionAwareShootingCostEvaluator
+from stable_worldmodel.planning import GoalMSE
 from codesign.trace_io import load_trace_npz, save_trace_npz, to_torch_tree
 
 
@@ -89,7 +91,19 @@ def run(cfg: DictConfig):
         f"W-modules={qstate.weight_modules} A-modules={qstate.activation_modules}"
     )
 
-    solver = _solver_from_record(cfg, model, record)
+    if hasattr(model, "get_cost"):
+        cost_model = model
+    else:
+        cost_model = PrecisionAwareShootingCostEvaluator(
+            model=model,
+            objective=GoalMSE(),
+        )
+        print(
+            "[codesign replay] wrapped Dynamics model with "
+            "PrecisionAwareShootingCostEvaluator + GoalMSE"
+        )
+
+    solver = _solver_from_record(cfg, cost_model, record)
     info = to_torch_tree(record["replay_info_dict"], device="cpu")
     trace = to_torch_tree(record["trace"][0], device="cpu")
     # Reference energy of the baseline final mean under the currently loaded model.

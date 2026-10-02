@@ -58,10 +58,10 @@ codesign:
   hysteresis: false
   downshift_delay: 2
   landscape:
-    mode_radius: 2.0
-    energy_weight: 0.45
-    spread_weight: 0.35
-    temporal_weight: 0.20
+    mode_radius: 8.0
+    energy_weight: 0.0
+    spread_weight: 0.70
+    temporal_weight: 0.30
     spread_scale: 1.0
     mean_shift_scale: 1.0
   replay_trace: null
